@@ -116,4 +116,6 @@ namespace MB {
         c.horizonFade = _p.horizonFade;
         c.temporalBlend = _p.temporalBlend;
         c.jitter[0] = _p.enabled ? _s.jitterX : 0.0f;
-        c.jitter[1]
+        c.jitter[1];
+    }
+}
