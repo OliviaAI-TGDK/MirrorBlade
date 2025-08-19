@@ -1,4 +1,26 @@
 // pch.hpp
+// --- harden against macro pollution -----------------------------------------
+#ifdef string
+#  undef string
+#endif
+#ifdef format
+#  undef format
+#endif
+#ifdef min
+#  undef min
+#endif
+#ifdef max
+#  undef max
+#endif
+
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+// -----------------------------------------------------------------------------
+
 #pragma once
 
 // =====================

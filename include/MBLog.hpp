@@ -1,24 +1,57 @@
-#pragma once
+﻿#pragma once
+
+// Scrub MIDL/Windows macro landmines that break <cstdarg>/<string>
+#ifdef string
+#  undef string
+#endif
+#ifdef small
+#  undef small
+#endif
+#ifdef hyper
+#  undef hyper
+#endif
+#ifdef uuid
+#  undef uuid
+#endif
+#ifdef near
+#  undef near
+#endif
+#ifdef far
+#  undef far
+#endif
+#ifdef min
+#  undef min
+#endif
+#ifdef max
+#  undef max
+#endif
+
 #include <atomic>
+#include <chrono>
+#include <cstdarg>
 #include <filesystem>
 #include <mutex>
 #include <string>
 
 namespace MB {
 
-    enum class LogLevel { Trace, Debug, Info, Warn, Error };
+    enum class LogLevel {
+        Trace = 0,
+        Debug = 1,
+        Info = 2,
+        Warn = 3,
+        Error = 4
+    };
 
     class Logger {
     public:
-        // Create/rotate logs under logDir, file name base: <base>.log, with size-based rotation
         void Init(const std::filesystem::path& logDir,
             const std::wstring& base = L"MirrorBladeBridge",
-            size_t maxBytes = 2 * 1024 * 1024,  // 2MB
+            std::size_t maxBytes = 2 * 1024 * 1024,
             int keep = 5);
 
         void SetLevel(LogLevel lvl);
 
-        // printf-style APIs
         void Log(LogLevel lvl, const char* fmt, ...);
         void LogErr(const char* fmt, ...);
 
@@ -27,17 +60,19 @@ namespace MB {
         void rotateIfNeededUnlocked();
         void writeUnlocked(const std::string& line);
 
-        std::atomic<LogLevel> _lvl{ LogLevel::Info };
-        std::mutex _mtx;
-        std::filesystem::path _dir;
-        std::filesystem::path _cur;
+        std::mutex _mtx{};
+        std::filesystem::path _dir{};
+        std::filesystem::path _cur{};
         std::wstring _base{ L"MirrorBladeBridge" };
-        size_t _maxBytes{ 2 * 1024 * 1024 };
+        std::size_t _maxBytes{ 2 * 1024 * 1024 };
         int _keep{ 5 };
+        std::atomic<LogLevel> _lvl{ LogLevel::Info };
     };
 
-    // global accessors used throughout the project
+    // Global accessor
     Logger& Log();
+
+    // Optional lifecycle helpers
     void InitLogs();
     void ShutdownLogs();
 

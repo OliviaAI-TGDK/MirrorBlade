@@ -1,19 +1,22 @@
 #pragma once
-#include <string>
 #include <functional>
+#include <string>
 #include <unordered_map>
-#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 namespace MB {
 
     class Ops {
     public:
-        using json = nlohmann::json;
-        using Handler = std::function<json(const json&)>;
+        using Handler = std::function<nlohmann::json(const nlohmann::json&)>;
 
-        static Ops& I();              // singleton
-        void RegisterAll();           // register supported ops
-        json Dispatch(const std::string& op, const json& args);
+        static Ops& I();
+
+        // Plan A: register a handler
+        void Register(const std::string& name, Handler h);
+
+        // Dispatch already exists in your TGDKOps.cpp; keep it.
+        nlohmann::json Dispatch(const std::string& op, const nlohmann::json& args);
 
     private:
         std::unordered_map<std::string, Handler> _map;
