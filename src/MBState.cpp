@@ -1,5 +1,6 @@
-#include "OpsHelpers.hpp"
+﻿#include "OpsHelpers.hpp"
 #include "MBState.hpp""
+#include <cassert>
 #include <RED4ext/GameEngine.hpp>
 
 namespace {

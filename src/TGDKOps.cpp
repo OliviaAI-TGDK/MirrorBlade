@@ -1,85 +1,153 @@
-﻿#include "MBOps.hpp"
-#include "MirrorBladeOps.hpp"
-#include "MBConfig.hpp"
-#include "MBLog.hpp"
+﻿#include "TGDKOps.hpp"
+
+#include "MBOps.hpp"
+#include "TGDKFigure8Fold.hpp"
+#include "Detox.hpp"
+#include "TGDKTelemetry.hpp"
+#include "5Col6Dex.hpp"
+#include "Visceptar.hpp"
+#include "Scooty.hpp"
 
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <string>
 
-using MB::Ops;
-using json = nlohmann::json;
+// Extra local macro hygiene (in case /FI got bypassed)
+#ifdef Event
+#  undef Event
+#endif
 
 namespace MB {
+    using json = nlohmann::json;
 
-    Ops& Ops::I() {
-        static Ops g;
-        return g;
+    static inline double NowSecs() {
+        using clock = std::chrono::steady_clock;
+        return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
     }
 
-    void Ops::RegisterAll() {
-        // Upscaler toggle
-        _map["upscaler.enable"] = [](const json& a) -> json {
-            bool en = a.value("enabled", false);
-            auto* ops = MirrorBladeOps::Instance();
-            bool result = ops ? ops->EnableUpscaler(en) : false;
-            MB::Log().Log(MB::LogLevel::Info, "Upscaler %s", result ? "enabled" : "disabled");
-            return json{ {"ok", true}, {"result", result} };
-            };
+    void RegisterTGDKOps() {
+        auto& ops = Ops::I();
 
-        // Traffic multiplier
-        _map["traffic.mul"] = [](const json& a) -> json {
-            double f = a.value("mult", 1.0);
-            auto* ops = MirrorBladeOps::Instance();
-            float result = ops ? ops->SetTrafficBoost(static_cast<float>(f)) : 1.0f;
-            MB::Log().Log(MB::LogLevel::Info, "Traffic multiplier set to %.2f", result);
-            return json{ {"ok", true}, {"result", result} };
-            };
+        // ---------------- figure8.* ----------------
+        ops.Register("figure8.evalBernoulli", [](const json& a) -> json {
+            const double t = a.value("t", 0.0);
+            const double A = a.value("a", 1.0);
+            auto xy = Figure8Fold::EvalLemniscateBernoulli(t, A);
+            return json{ {"ok", true}, {"x", xy.first}, {"y", xy.second} };
+            });
 
-        // Diagnostics
-        _map["diag.dump"] = [](const json&) -> json {
-            auto* ops = MirrorBladeOps::Instance();
-            std::string diag = ops ? std::string(ops->DumpDiag().c_str()) : "{}";
-            return json{ {"ok", true}, {"result", diag} };
-            };
+        // args: { t, ax, ay, nx, ny, phase }
+        ops.Register("figure8.evalLissajous12", [](const json& a) -> json {
+            const double t = a.value("t", 0.0);
+            const double ax = a.value("ax", 1.0);
+            const double ay = a.value("ay", 1.0);
+            const double nx = a.value("nx", 1.0);
+            const double ny = a.value("ny", 2.0);
+            const double phase = a.value("phase", 0.0);
+            auto xy = Figure8Fold::EvalLissajous12(t, ax, ay, nx, ny, phase);
+            return json{ {"ok", true}, {"x", xy.first}, {"y", xy.second} };
+            });
 
-        // Config reload/save
-        _map["config.reload"] = [](const json&) -> json {
-            bool ok = MB::ReloadConfig();
-            MB::Log().Log(ok ? MB::LogLevel::Info : MB::LogLevel::Error,
-                ok ? "Config reloaded" : "Config reload failed");
-            return json{ {"ok", ok} };
-            };
+        // ---------------- detox.* ------------------
+        static Detox g_detox;
 
-        _map["config.save"] = [](const json&) -> json {
-            bool ok = MB::SaveConfig();
-            MB::Log().Log(ok ? MB::LogLevel::Info : MB::LogLevel::Error,
-                ok ? "Config saved" : "Config save failed");
-            return json{ {"ok", ok} };
-            };
+        ops.Register("detox.set", [](const json& a) -> json {
+            g_detox.ConfigureFromJSON(a);
+            return json{ {"ok", true} };
+            });
 
-        // Healthcheck
-        _map["ping"] = [](const json&) -> json {
-            return json{ {"ok", true}, {"result", "pong"} };
-            };
-    }
+        // { density01, avgSpeed, refSpeed, base, post, detail, t }
+        ops.Register("detox.eval", [](const json& a) -> json {
+            Detox::DeflectInput in{};
+            in.density01 = a.value("density01", 0.0);
+            in.avgSpeed = a.value("avgSpeed", 0.0);
+            in.refSpeed = a.value("refSpeed", 20.0);
 
-    json Ops::Dispatch(const std::string& op, const json& args) {
-        auto it = _map.find(op);
-        if (it == _map.end()) {
-            MB::Log().Log(MB::LogLevel::Warn, "Unknown op: %s", op.c_str());
-            return json{ {"ok", false}, {"error", std::string("Unknown op: ") + op} };
-        }
-        try {
-            return it->second(args);
-        }
-        catch (const std::exception& e) {
-            MB::Log().Log(MB::LogLevel::Error, "Op '%s' threw: %s", op.c_str(), e.what());
-            return json{ {"ok", false}, {"error", e.what()} };
-        }
-        catch (...) {
-            MB::Log().Log(MB::LogLevel::Error, "Op '%s' threw unknown exception", op.c_str());
-            return json{ {"ok", false}, {"error", "unknown error"} };
-        }
+            auto cp = g_detox.EvaluateDeflection(in);
+
+            const double base = a.value("base", 0.0);
+            const double post = a.value("post", base);
+            const double detail = a.value("detail", 0.0);
+            auto ir = g_detox.Intercede(base, post, detail);
+
+            const double tparam = a.value("t", 0.5);
+            auto fr = g_detox.FoldSpecimen(static_cast<float>(tparam));
+
+            return json{
+                {"ok", true},
+                {"chart",     {{"x", cp.x}, {"y", cp.y}, {"deflection", cp.deflection}}},
+                {"intercede", {{"value", ir.value}, {"proportion", ir.proportion}, {"gated", ir.gated}}},
+                {"fold",      {{"specimen", fr.specimen}, {"curvature", fr.curvature}}},
+                {"params",    g_detox.SnapshotJSON()}
+            };
+            });
+
+        ops.Register("detox.snapshot", [](const json&) -> json {
+            return json{ {"ok", true}, {"params", g_detox.SnapshotJSON()} };
+            });
+
+        // ---------------- scooty.* -----------------
+        ops.Register("scooty.bump", [](const json& a) -> json {
+            const double v = a.value("v", 0.0);
+            Scooty::Get().Bump(v);
+            return json{ {"ok", true}, {"added", v} };
+            });
+
+        ops.Register("scooty.snapshot", [](const json&) -> json {
+            auto st = Scooty::Get().Compute();
+            return json{ {"ok", true},
+                        {"stats", {{"min", st.min}, {"max", st.max}, {"mean", st.mean}, {"stddev", st.stddev}}} };
+            });
+
+        ops.Register("scooty.samples", [](const json& a) -> json {
+            int n = a.value("n", 25);
+            if (n < 1) n = 25;
+            if (n > 512) n = 512;
+
+            auto v = Scooty::Get().Samples(static_cast<std::size_t>(n));
+
+            MB::Visceptar::Style st;
+            st.h = '=';
+            st.corner = '#';
+            st.pad = 1;
+
+            const std::string title = "Scooty Samples";
+            const std::string framed = MB::FiveColSixDex::FormatFramed(v, 5, 6, title, st);
+
+            return json{ {"ok", true}, {"count", (int)v.size()}, {"framed", framed} };
+            });
+
+        // --------------- telem.* -------------------
+        // telem.push: { name, a, b, c, tag }
+        ops.Register("telem.push", [](const json& a) -> json {
+            TGDKTelemetry::Event ev{};
+            ev.t = NowSecs();
+            ev.name = a.value("name", std::string("evt"));
+            ev.a = a.value("a", 0.0);
+            ev.b = a.value("b", 0.0);
+            ev.c = a.value("c", 0.0);
+            ev.tag = a.value("tag", std::string());
+            TGDKTelemetry::Get().Push(ev);
+            return json{ {"ok", true} };
+            });
+
+        // telem.snapshot: { max }
+        ops.Register("telem.snapshot", [](const json& a) -> json {
+            const int maxN = std::max(1, a.value("max", 64));
+            return json{ {"ok", true}, {"events", TGDKTelemetry::Get().SnapshotJSON((std::size_t)maxN)} };
+            });
+
+        // telem.table: { max, title }
+        ops.Register("telem.table", [](const json& a) -> json {
+            const int maxN = std::max(1, a.value("max", 32));
+            MB::Visceptar::Style st;
+            st.h = '-';
+            st.corner = '+';
+            st.pad = 1;
+            const std::string title = a.value("title", std::string("Telemetry"));
+            const std::string txt = TGDKTelemetry::Get().FormatTable((std::size_t)maxN, title, st);
+            return json{ {"ok", true}, {"framed", txt} };
+            });
     }
 
 } // namespace MB

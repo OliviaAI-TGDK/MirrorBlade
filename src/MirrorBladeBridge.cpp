@@ -4,18 +4,9 @@
 //  - Starts a named-pipe JSON RPC server for external control ("\\\\.\\pipe\\MirrorBladeBridge-v1").
 //  - Queues work onto a lightweight "game-thread" pump (replace with a real tick hook later).
 //  - Exposes a set of example ops (traffic/npc/vehicle/ui/etc) plus upscaler control ops.
-//  - Integrates with an optional upscaler module (see Upscaler.hpp).
+//  - Integrates with an optional upscaler module.
 //
-// Notes:
-//  - This TU defines MB::InitBridge/ShutdownBridge. Ensure NO other TU defines them.
-//  - Feed real game/RTTI calls in the TODO blocks.
-//  - JSON schema: { v:1, id?:..., op:"...", args:{...} } -> replies mirror v/id and include ok/result|error.
-//
-// Build requirements:
-//  - RED4ext SDK headers
-//  - nlohmann::json
-//  - Windows SDK
-//  - Your Upscaler.hpp (optional; stubs compiled out if not available)
+// JSON schema: { v:1, id?:..., op:"...", args:{...} } -> replies mirror v/id and include ok/result|error.
 
 #include "MirrorBladeBridge.hpp"
 
@@ -26,6 +17,8 @@
 #include <RED4ext/Api/Sdk.hpp>
 
 #include <Windows.h>
+#include <nlohmann/json.hpp>
+
 #include <string>
 #include <thread>
 #include <atomic>
@@ -38,11 +31,35 @@
 #include <cstdarg>
 #include <algorithm>
 
-#include "json.hpp" // nlohmann::json
-using json = nlohmann::json;
+// -------- Optional LightFilter integration (compile-time guarded) --------
+#if __has_include("LightFilter.hpp")
+#include "LightFilter.hpp"
+#define MB_HAS_LIGHTSFAKE 1
+#else
+#define MB_HAS_LIGHTSFAKE 0
+#endif
 
-// If you have the upscaler module, include its API:
-#include "Upscaler.hpp" // declares MB::Upscaler_* , MB::UpscaleMode, MB::UpscalerParams
+// -------- Optional Upscaler integration (compile-time guarded) --------
+#if __has_include("Upscaler.hpp")
+#include "Upscaler.hpp" // defines MB::UpscalerParams, UpscaleMode, API funcs
+#define MB_UPSCALER_AVAILABLE 1
+#else
+#define MB_UPSCALER_AVAILABLE 0
+namespace MB {
+    enum class UpscaleMode { Off, FSR2 };
+    struct UpscalerParams {
+        uint32_t outputWidth = 0, outputHeight = 0;
+        uint32_t renderWidth = 0, renderHeight = 0;
+        float sharpness = 0.0f;
+    };
+    inline void Upscaler_Enable(bool) {}
+    inline void Upscaler_SetMode(UpscaleMode) {}
+    inline void Upscaler_SetParams(const UpscalerParams&) {}
+    inline void Upscaler_Resize(const UpscalerParams&) {}
+}
+#endif
+
+using json = nlohmann::json;
 
 // -------------------- Logging --------------------
 static void MB_Log(const char* msg)
@@ -71,10 +88,8 @@ static void ReplyOk(const json& req, OpReply reply, json result = json::object()
         {"ok", true},
         {"result", std::move(result)}
     };
-    if (req.contains("id"))
-        r["id"] = req["id"];
-    if (reply)
-        reply(std::move(r));
+    if (req.contains("id")) r["id"] = req["id"];
+    if (reply) reply(std::move(r));
 }
 
 static void ReplyErr(const json& req, OpReply reply, const std::string& code, const std::string& msg)
@@ -84,10 +99,8 @@ static void ReplyErr(const json& req, OpReply reply, const std::string& code, co
         {"ok", false},
         {"error", { {"code", code}, {"msg", msg} }}
     };
-    if (req.contains("id"))
-        r["id"] = req["id"];
-    if (reply)
-        reply(std::move(r));
+    if (req.contains("id")) r["id"] = req["id"];
+    if (reply) reply(std::move(r));
 }
 
 // -------------------- Globals --------------------
@@ -168,12 +181,11 @@ static std::optional<std::string> ReadLine(HANDLE pipe)
 }
 
 // -------------------- Ops --------------------
-static void Op_UI_Toast(const json& req, std::function<void(json)> reply)
+static void Op_UI_Toast(const json& req, OpReply reply)
 {
-    auto& args = req["args"];
+    const auto& args = req.value("args", json::object());
     if (!args.contains("text")) return ReplyErr(req, reply, "BadArgs", "args.text required");
-    int ms = args.value("ms", 2000);
-    if (ms <= 0) return ReplyErr(req, reply, "BadArgs", "ms must be > 0");
+    int ms = std::max(1, args.value("ms", 2000));
     std::string text = args["text"].get<std::string>();
 
     EnqueueOnGameThread([req, reply, ms, text]() {
@@ -183,9 +195,9 @@ static void Op_UI_Toast(const json& req, std::function<void(json)> reply)
         });
 }
 
-static void Op_TimeScale_Set(const json& req, std::function<void(json)> reply)
+static void Op_TimeScale_Set(const json& req, OpReply reply)
 {
-    auto& args = req["args"];
+    const auto& args = req.value("args", json::object());
     if (!args.contains("scale")) return ReplyErr(req, reply, "BadArgs", "args.scale required");
     double scale = args["scale"].get<double>();
     if (scale <= 0.0 || scale > 10.0) return ReplyErr(req, reply, "BadArgs", "scale out of range (0,10]");
@@ -197,10 +209,11 @@ static void Op_TimeScale_Set(const json& req, std::function<void(json)> reply)
         });
 }
 
-static void Op_LOD_Pin(const json& req, std::function<void(json)> reply)
+static void Op_LOD_Pin(const json& req, OpReply reply)
 {
-    int ttl = req["args"].value("ttl", 3000);
-    std::string tag = req["args"].value("tag", "default");
+    const auto& args = req.value("args", json::object());
+    int ttl = std::max(1, args.value("ttl", 3000));
+    std::string tag = args.value("tag", std::string("default"));
     EnqueueOnGameThread([req, reply, ttl, tag]() {
         MB_Logf("[lod.pin] tag=%s ttl=%d", tag.c_str(), ttl);
         // TODO: LOD pin impl
@@ -208,9 +221,10 @@ static void Op_LOD_Pin(const json& req, std::function<void(json)> reply)
         });
 }
 
-static void Op_Traffic_Mul(const json& req, std::function<void(json)> reply)
+static void Op_Traffic_Mul(const json& req, OpReply reply)
 {
-    double mult = req["args"].value("mult", 1.0);
+    const auto& args = req.value("args", json::object());
+    double mult = args.value("mult", 1.0);
     if (mult <= 0.01 || mult > 50.0) return ReplyErr(req, reply, "BadArgs", "mult out of range");
     EnqueueOnGameThread([req, reply, mult]() {
         MB_Logf("[traffic.mul] mult=%.3f", mult);
@@ -220,205 +234,241 @@ static void Op_Traffic_Mul(const json& req, std::function<void(json)> reply)
 }
 
 // --- NPC ---
-static void Op_NPC_Freeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"npc", "frozen"} }); }
-static void Op_NPC_Unfreeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"npc", "unfrozen"} }); }
-static void Op_NPC_Spawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "npc_default");
+static void Op_NPC_Freeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"npc", "frozen"} }); }
+static void Op_NPC_Unfreeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"npc", "unfrozen"} }); }
+static void Op_NPC_Spawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("npc_default"));
     ReplyOk(req, reply, { {"npc", id}, {"spawned", true} });
 }
-static void Op_NPC_Despawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "npc_default");
+static void Op_NPC_Despawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("npc_default"));
     ReplyOk(req, reply, { {"npc", id}, {"despawned", true} });
 }
-static void Op_NPC_Teleport(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
+static void Op_NPC_Teleport(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
     ReplyOk(req, reply, { {"npc", "teleported"}, {"pos", pos} });
 }
 
 // --- Vehicle ---
-static void Op_Vehicle_Spawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "Vehicle.v_default");
+static void Op_Vehicle_Spawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("Vehicle.v_default"));
     ReplyOk(req, reply, { {"vehicle", id}, {"spawned", true} });
 }
-static void Op_Vehicle_Despawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "Vehicle.v_default");
+static void Op_Vehicle_Despawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("Vehicle.v_default"));
     ReplyOk(req, reply, { {"vehicle", id}, {"despawned", true} });
 }
-static void Op_Vehicle_Boost(const json& req, std::function<void(json)> reply) {
-    double boost = req["args"].value("factor", 2.0);
+static void Op_Vehicle_Boost(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    double boost = args.value("factor", 2.0);
     ReplyOk(req, reply, { {"boostFactor", boost} });
 }
-static void Op_Vehicle_Paint(const json& req, std::function<void(json)> reply) {
-    std::string color = req["args"].value("color", "red");
+static void Op_Vehicle_Paint(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string color = args.value("color", std::string("red"));
     ReplyOk(req, reply, { {"painted", true}, {"color", color} });
 }
-static void Op_Vehicle_Repair(const json& req, std::function<void(json)> reply) {
+static void Op_Vehicle_Repair(const json& req, OpReply reply) {
     ReplyOk(req, reply, { {"vehicle", "repaired"} });
 }
 
 // --- Traffic ---
-static void Op_Traffic_Clear(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"traffic", "cleared"} }); }
-static void Op_Traffic_Freeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"traffic", "frozen"} }); }
-static void Op_Traffic_Unfreeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"traffic", "unfrozen"} }); }
-static void Op_Traffic_Route(const json& req, std::function<void(json)> reply) {
-    auto route = req["args"].value("route", json::array());
+static void Op_Traffic_Clear(const json& req, OpReply reply) { ReplyOk(req, reply, { {"traffic", "cleared"} }); }
+static void Op_Traffic_Freeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"traffic", "frozen"} }); }
+static void Op_Traffic_Unfreeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"traffic", "unfrozen"} }); }
+static void Op_Traffic_Route(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto route = args.value("route", json::array());
     ReplyOk(req, reply, { {"trafficRoute", route} });
 }
-static void Op_Traffic_Persist(const json& req, std::function<void(json)> reply) {
-    bool enabled = req["args"].value("enabled", true);
+static void Op_Traffic_Persist(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool enabled = args.value("enabled", true);
     ReplyOk(req, reply, { {"persist", enabled} });
 }
 
 // --- AV (aerial vehicles) ---
-static void Op_AV_Spawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "AV.default");
+static void Op_AV_Spawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("AV.default"));
     ReplyOk(req, reply, { {"av", id}, {"spawned", true} });
 }
-static void Op_AV_Route_Set(const json& req, std::function<void(json)> reply) {
-    auto pts = req["args"].value("points", json::array());
+static void Op_AV_Route_Set(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pts = args.value("points", json::array());
     ReplyOk(req, reply, { {"avRoute", pts} });
 }
-static void Op_AV_Despawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "AV.default");
+static void Op_AV_Despawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("AV.default"));
     ReplyOk(req, reply, { {"av", id}, {"despawned", true} });
 }
-static void Op_AV_Land(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"av", "landed"} }); }
-static void Op_AV_Takeoff(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"av", "takeoff"} }); }
+static void Op_AV_Land(const json& req, OpReply reply) { ReplyOk(req, reply, { {"av", "landed"} }); }
+static void Op_AV_Takeoff(const json& req, OpReply reply) { ReplyOk(req, reply, { {"av", "takeoff"} }); }
 
 // --- Train ---
-static void Op_Train_Persist(const json& req, std::function<void(json)> reply) {
-    bool enabled = req["args"].value("enabled", true);
+static void Op_Train_Persist(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool enabled = args.value("enabled", true);
     ReplyOk(req, reply, { {"trainPersist", enabled} });
 }
-static void Op_Train_Spawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "train_default");
+static void Op_Train_Spawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("train_default"));
     ReplyOk(req, reply, { {"train", id}, {"spawned", true} });
 }
-static void Op_Train_Despawn(const json& req, std::function<void(json)> reply) {
-    std::string id = req["args"].value("id", "train_default");
+static void Op_Train_Despawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string id = args.value("id", std::string("train_default"));
     ReplyOk(req, reply, { {"train", id}, {"despawned", true} });
 }
-static void Op_Train_Freeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"train", "frozen"} }); }
-static void Op_Train_Unfreeze(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"train", "unfrozen"} }); }
+static void Op_Train_Freeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"train", "frozen"} }); }
+static void Op_Train_Unfreeze(const json& req, OpReply reply) { ReplyOk(req, reply, { {"train", "unfrozen"} }); }
 
 // --- UI ---
-static void Op_UI_Alert(const json& req, std::function<void(json)> reply) {
-    std::string text = req["args"].value("text", "Alert");
-    int ms = req["args"].value("ms", 2000);
+static void Op_UI_Alert(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string text = args.value("text", std::string("Alert"));
+    int ms = std::max(1, args.value("ms", 2000));
     ReplyOk(req, reply, { {"type","alert"},{"text",text},{"ms",ms} });
 }
-static void Op_UI_Marker_Add(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
-    std::string tag = req["args"].value("tag", "marker");
+static void Op_UI_Marker_Add(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
+    std::string tag = args.value("tag", std::string("marker"));
     ReplyOk(req, reply, { {"marker","added"},{"tag",tag},{"pos",pos} });
 }
-static void Op_UI_Marker_Remove(const json& req, std::function<void(json)> reply) {
-    std::string tag = req["args"].value("tag", "marker");
+static void Op_UI_Marker_Remove(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string tag = args.value("tag", std::string("marker"));
     ReplyOk(req, reply, { {"marker","removed"},{"tag",tag} });
 }
-static void Op_UI_HUD_Toggle(const json& req, std::function<void(json)> reply) {
-    bool visible = req["args"].value("visible", true);
+static void Op_UI_HUD_Toggle(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool visible = args.value("visible", true);
     ReplyOk(req, reply, { {"hudVisible", visible} });
 }
 
 // --- Time / Weather ---
-static void Op_Time_Set(const json& req, std::function<void(json)> reply) {
-    int hour = req["args"].value("hour", 12);
-    int minute = req["args"].value("minute", 0);
+static void Op_Time_Set(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    int hour = std::clamp(args.value("hour", 12), 0, 23);
+    int minute = std::clamp(args.value("minute", 0), 0, 59);
     ReplyOk(req, reply, { {"timeSet", true}, {"hour", hour}, {"minute", minute} });
 }
-static void Op_Time_Pause(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"time", "paused"} }); }
-static void Op_Time_Resume(const json& req, std::function<void(json)> reply) { ReplyOk(req, reply, { {"time", "resumed"} }); }
-static void Op_Weather_Set(const json& req, std::function<void(json)> reply) {
-    std::string preset = req["args"].value("preset", "Clear");
-    float blend = req["args"].value("blend", 1.0f);
+static void Op_Time_Pause(const json& req, OpReply reply) { ReplyOk(req, reply, { {"time", "paused"} }); }
+static void Op_Time_Resume(const json& req, OpReply reply) { ReplyOk(req, reply, { {"time", "resumed"} }); }
+static void Op_Weather_Set(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string preset = args.value("preset", std::string("Clear"));
+    float blend = args.value("blend", 1.0f);
     ReplyOk(req, reply, { {"weatherPreset", preset}, {"blend", blend} });
 }
 
 // --- Player ---
-static void Op_Player_Teleport(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
-    float yaw = req["args"].value("yaw", 0.0f);
+static void Op_Player_Teleport(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
+    float yaw = args.value("yaw", 0.0f);
     ReplyOk(req, reply, { {"teleported", true}, {"pos", pos}, {"yaw", yaw} });
 }
-static void Op_Player_Heal(const json& req, std::function<void(json)> reply) {
-    float amount = req["args"].value("amount", 100.0f);
+static void Op_Player_Heal(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    float amount = args.value("amount", 100.0f);
     ReplyOk(req, reply, { {"healed", amount} });
 }
-static void Op_Player_Damage(const json& req, std::function<void(json)> reply) {
-    float amount = req["args"].value("amount", 10.0f);
-    std::string type = req["args"].value("type", "generic");
+static void Op_Player_Damage(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    float amount = args.value("amount", 10.0f);
+    std::string type = args.value("type", std::string("generic"));
     ReplyOk(req, reply, { {"damaged", amount}, {"type", type} });
 }
-static void Op_Player_Inventory_Add(const json& req, std::function<void(json)> reply) {
-    std::string item = req["args"].value("item", "Item.Default");
-    int count = req["args"].value("count", 1);
+static void Op_Player_Inventory_Add(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string item = args.value("item", std::string("Item.Default"));
+    int count = std::max(1, args.value("count", 1));
     ReplyOk(req, reply, { {"added", item}, {"count", count} });
 }
-static void Op_Player_Inventory_Remove(const json& req, std::function<void(json)> reply) {
-    std::string item = req["args"].value("item", "Item.Default");
-    int count = req["args"].value("count", 1);
+static void Op_Player_Inventory_Remove(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string item = args.value("item", std::string("Item.Default"));
+    int count = std::max(1, args.value("count", 1));
     ReplyOk(req, reply, { {"removed", item}, {"count", count} });
 }
 
 // --- World / Streaming / LOD ---
-static void Op_World_Spawn_Explosion(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
-    float radius = req["args"].value("radius", 5.0f);
-    float power = req["args"].value("power", 1.0f);
+static void Op_World_Spawn_Explosion(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
+    float radius = args.value("radius", 5.0f);
+    float power = args.value("power", 1.0f);
     ReplyOk(req, reply, { {"explosion","queued"},{"pos",pos},{"radius",radius},{"power",power} });
 }
-static void Op_World_Light_Spawn(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
-    float intensity = req["args"].value("intensity", 1000.0f);
-    std::string color = req["args"].value("color", "#FFFFFF");
-    std::string tag = req["args"].value("tag", "light1");
+static void Op_World_Light_Spawn(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
+    float intensity = args.value("intensity", 1000.0f);
+    std::string color = args.value("color", std::string("#FFFFFF"));
+    std::string tag = args.value("tag", std::string("light1"));
     ReplyOk(req, reply, { {"light","spawned"},{"tag",tag},{"pos",pos},{"intensity",intensity},{"color",color} });
 }
-static void Op_World_Light_Remove(const json& req, std::function<void(json)> reply) {
-    std::string tag = req["args"].value("tag", "light1");
+static void Op_World_Light_Remove(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string tag = args.value("tag", std::string("light1"));
     ReplyOk(req, reply, { {"light","removed"},{"tag",tag} });
 }
-static void Op_World_StreamGrid_Recenter(const json& req, std::function<void(json)> reply) {
-    auto pos = req["args"].value("pos", json::object());
-    std::string mode = req["args"].value("mode", "auto");
+static void Op_World_StreamGrid_Recenter(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    auto pos = args.value("pos", json::object());
+    std::string mode = args.value("mode", std::string("auto"));
     ReplyOk(req, reply, { {"streamgrid","recentered"},{"mode",mode},{"pos",pos} });
 }
-static void Op_World_LOD_Lock(const json& req, std::function<void(json)> reply) {
-    int ttl = req["args"].value("ttl", 3000);
-    std::string tag = req["args"].value("tag", "lodlock");
+static void Op_World_LOD_Lock(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    int ttl = std::max(1, args.value("ttl", 3000));
+    std::string tag = args.value("tag", std::string("lodlock"));
     ReplyOk(req, reply, { {"lodLocked", true},{"ttl",ttl},{"tag",tag} });
 }
-static void Op_World_LOD_Unlock(const json& req, std::function<void(json)> reply) {
-    std::string tag = req["args"].value("tag", "lodlock");
+static void Op_World_LOD_Unlock(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string tag = args.value("tag", std::string("lodlock"));
     ReplyOk(req, reply, { {"lodLocked", false},{"tag",tag} });
 }
 
 // --- Debug / Telemetry ---
-static void Op_Debug_Log(const json& req, std::function<void(json)> reply) {
-    std::string level = req["args"].value("level", "info");
-    std::string msg = req["args"].value("msg", "(empty)");
+static void Op_Debug_Log(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string level = args.value("level", std::string("info"));
+    std::string msg = args.value("msg", std::string("(empty)"));
     MB_Logf("[debug.%s] %s", level.c_str(), msg.c_str());
     ReplyOk(req, reply, { {"logged", true}, {"level", level}, {"msg", msg} });
 }
-static void Op_Debug_Capture_Screenshot(const json& req, std::function<void(json)> reply) {
-    std::string path = req["args"].value("path", "screenshot.png");
+static void Op_Debug_Capture_Screenshot(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string path = args.value("path", std::string("screenshot.png"));
     ReplyOk(req, reply, { {"screenshot","queued"},{"path",path} });
 }
 
 // --- Config / Introspection ---
-static void Op_Config_Set(const json& req, std::function<void(json)> reply) {
-    std::string key = req["args"].value("key", "");
-    json value = req["args"].value("value", json());
+static void Op_Config_Set(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string key = args.value("key", std::string());
+    json value = args.value("value", json());
     if (key.empty()) { return ReplyErr(req, reply, "BadArgs", "key required"); }
     ReplyOk(req, reply, { {"set", key}, {"value", value} });
 }
-static void Op_Config_Get(const json& req, std::function<void(json)> reply) {
-    std::string key = req["args"].value("key", "");
+static void Op_Config_Get(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string key = args.value("key", std::string());
     if (key.empty()) { return ReplyErr(req, reply, "BadArgs", "key required"); }
     ReplyOk(req, reply, { {"key", key}, {"value", "(stub)"} });
 }
-static void Op_Ops_Capabilities(const json& req, std::function<void(json)> reply) {
+static void Op_Ops_Capabilities(const json& req, OpReply reply) {
     json caps = json::array({
         "ui.toast","ui.alert","ui.marker.add","ui.marker.remove","ui.hud.toggle",
         "time.set","time.pause","time.resume","timescale.set","weather.set",
@@ -434,18 +484,28 @@ static void Op_Ops_Capabilities(const json& req, std::function<void(json)> reply
         "debug.log","debug.capture.screenshot","config.set","config.get","ops.capabilities","lod.pin","ping",
         "upscaler.enable","upscaler.set","graphics.target.set","graphics.internal.scale"
         });
+#if MB_HAS_LIGHTSFAKE
+    caps.push_back("lights.fake.adverts");
+    caps.push_back("lights.fake.portals");
+    caps.push_back("lights.fake.forceportals");
+    caps.push_back("lights.fake.sweep");
+#endif
     ReplyOk(req, reply, { {"capabilities", caps} });
 }
-static void Op_Ping(const json& req, std::function<void(json)> reply) {
-    std::string echo = req["args"].value("echo", "pong");
+static void Op_Ping(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    std::string echo = args.value("echo", std::string("pong"));
     ReplyOk(req, reply, { {"pong", true}, {"echo", echo} });
 }
 
 // --- Upscaler control ---
-static void Op_Upscaler_Enable(const json& req, std::function<void(json)> reply)
+static MB::UpscalerParams g_upParams{};
+
+static void Op_Upscaler_Enable(const json& req, OpReply reply)
 {
-#if defined(MB_UPSCALER_AVAILABLE) || 1
-    bool enabled = req["args"].value("enabled", true);
+#if MB_UPSCALER_AVAILABLE
+    const auto& args = req.value("args", json::object());
+    bool enabled = args.value("enabled", true);
     MB::Upscaler_Enable(enabled);
     ReplyOk(req, reply, { {"enabled", enabled} });
 #else
@@ -453,19 +513,19 @@ static void Op_Upscaler_Enable(const json& req, std::function<void(json)> reply)
 #endif
 }
 
-static void Op_Upscaler_Set(const json& req, std::function<void(json)> reply)
+static void Op_Upscaler_Set(const json& req, OpReply reply)
 {
-#if defined(MB_UPSCALER_AVAILABLE) || 1
-    std::string mode = req["args"].value("mode", "off");
-    float sharp = req["args"].value("sharpness", 0.6f);
+#if MB_UPSCALER_AVAILABLE
+    const auto& args = req.value("args", json::object());
+    std::string mode = args.value("mode", std::string("off"));
+    float sharp = args.value("sharpness", 0.6f);
 
     if (mode == "off") MB::Upscaler_SetMode(MB::UpscaleMode::Off);
     else if (mode == "fsr2") MB::Upscaler_SetMode(MB::UpscaleMode::FSR2);
     else return ReplyErr(req, reply, "BadArgs", "mode must be off|fsr2");
 
-    auto p = MB::UpscalerParams{};
-    p.sharpness = sharp;
-    MB::Upscaler_SetParams(p);
+    g_upParams.sharpness = sharp;
+    MB::Upscaler_SetParams(g_upParams);
 
     ReplyOk(req, reply, { {"mode", mode}, {"sharpness", sharp} });
 #else
@@ -473,13 +533,12 @@ static void Op_Upscaler_Set(const json& req, std::function<void(json)> reply)
 #endif
 }
 
-static MB::UpscalerParams g_upParams{};
-
-static void Op_Graphics_Target_Set(const json& req, std::function<void(json)> reply)
+static void Op_Graphics_Target_Set(const json& req, OpReply reply)
 {
-#if defined(MB_UPSCALER_AVAILABLE) || 1
-    g_upParams.outputWidth = req["args"].value("width", 3840u);
-    g_upParams.outputHeight = req["args"].value("height", 2160u);
+#if MB_UPSCALER_AVAILABLE
+    const auto& args = req.value("args", json::object());
+    g_upParams.outputWidth = args.value("width", 3840u);
+    g_upParams.outputHeight = args.value("height", 2160u);
     MB::Upscaler_Resize(g_upParams);
     ReplyOk(req, reply, { {"width", g_upParams.outputWidth}, {"height", g_upParams.outputHeight} });
 #else
@@ -487,10 +546,11 @@ static void Op_Graphics_Target_Set(const json& req, std::function<void(json)> re
 #endif
 }
 
-static void Op_Graphics_Internal_Scale(const json& req, std::function<void(json)> reply)
+static void Op_Graphics_Internal_Scale(const json& req, OpReply reply)
 {
-#if defined(MB_UPSCALER_AVAILABLE) || 1
-    float s = req["args"].value("scale", 0.5f);
+#if MB_UPSCALER_AVAILABLE
+    const auto& args = req.value("args", json::object());
+    float s = std::clamp(args.value("scale", 0.5f), 0.05f, 2.0f);
     g_upParams.renderWidth = (uint32_t)std::max(16.0f, s * static_cast<float>(g_upParams.outputWidth));
     g_upParams.renderHeight = (uint32_t)std::max(16.0f, s * static_cast<float>(g_upParams.outputHeight));
     MB::Upscaler_Resize(g_upParams);
@@ -500,9 +560,120 @@ static void Op_Graphics_Internal_Scale(const json& req, std::function<void(json)
 #endif
 }
 
+#if MB_HAS_LIGHTSFAKE
+// ---- Optional LightFilter JSON ops ----
+static void Op_LightsFake_Adverts(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool on = args.value("enabled", true);
+    MB::LightFilter::Get().SetAdverts(on);
+    ReplyOk(req, reply, { {"adverts", on} });
+}
+static void Op_LightsFake_Portals(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool on = args.value("enabled", false);
+    MB::LightFilter::Get().SetPortals(on);
+    ReplyOk(req, reply, { {"portals", on} });
+}
+static void Op_LightsFake_ForcePortals(const json& req, OpReply reply) {
+    const auto& args = req.value("args", json::object());
+    bool on = args.value("enabled", false);
+    MB::LightFilter::Get().SetForcePortals(on);
+    ReplyOk(req, reply, { {"forcePortals", on} });
+}
+static void Op_LightsFake_Sweep(const json& req, OpReply reply) {
+    (void)req;
+    // If you have a world pointer available via SDK, pass it in:
+    // MB::LightFilter::Get().SweepWorld(worldPtr);
+    ReplyOk(req, reply, { {"sweep", "ok"} });
+}
+#endif // MB_HAS_LIGHTSFAKE
+
 // -------------------- Op registry --------------------
-using OpHandler = std::function<void(const json& req, std::function<void(json)> reply)>;
-static std::unordered_map<std::string, OpHandler> g_ops;
+using OpHandler = std::function<void(const json& req, OpReply reply)>;
+static std::unordered_map<std::string, OpHandler> g_opTable;
+
+static void RegisterOps()
+{
+    g_opTable.emplace("ui.toast", &Op_UI_Toast);
+    g_opTable.emplace("timescale.set", &Op_TimeScale_Set);
+    g_opTable.emplace("lod.pin", &Op_LOD_Pin);
+    g_opTable.emplace("traffic.mul", &Op_Traffic_Mul);
+
+    g_opTable.emplace("npc.freeze", &Op_NPC_Freeze);
+    g_opTable.emplace("npc.unfreeze", &Op_NPC_Unfreeze);
+    g_opTable.emplace("npc.spawn", &Op_NPC_Spawn);
+    g_opTable.emplace("npc.despawn", &Op_NPC_Despawn);
+    g_opTable.emplace("npc.teleport", &Op_NPC_Teleport);
+
+    g_opTable.emplace("vehicle.spawn", &Op_Vehicle_Spawn);
+    g_opTable.emplace("vehicle.despawn", &Op_Vehicle_Despawn);
+    g_opTable.emplace("vehicle.boost", &Op_Vehicle_Boost);
+    g_opTable.emplace("vehicle.paint", &Op_Vehicle_Paint);
+    g_opTable.emplace("vehicle.repair", &Op_Vehicle_Repair);
+
+    g_opTable.emplace("traffic.clear", &Op_Traffic_Clear);
+    g_opTable.emplace("traffic.freeze", &Op_Traffic_Freeze);
+    g_opTable.emplace("traffic.unfreeze", &Op_Traffic_Unfreeze);
+    g_opTable.emplace("traffic.route", &Op_Traffic_Route);
+    g_opTable.emplace("traffic.persist", &Op_Traffic_Persist);
+
+    g_opTable.emplace("av.spawn", &Op_AV_Spawn);
+    g_opTable.emplace("av.route.set", &Op_AV_Route_Set);
+    g_opTable.emplace("av.despawn", &Op_AV_Despawn);
+    g_opTable.emplace("av.land", &Op_AV_Land);
+    g_opTable.emplace("av.takeoff", &Op_AV_Takeoff);
+
+    g_opTable.emplace("train.persist", &Op_Train_Persist);
+    g_opTable.emplace("train.spawn", &Op_Train_Spawn);
+    g_opTable.emplace("train.despawn", &Op_Train_Despawn);
+    g_opTable.emplace("train.freeze", &Op_Train_Freeze);
+    g_opTable.emplace("train.unfreeze", &Op_Train_Unfreeze);
+
+    g_opTable.emplace("ui.alert", &Op_UI_Alert);
+    g_opTable.emplace("ui.marker.add", &Op_UI_Marker_Add);
+    g_opTable.emplace("ui.marker.remove", &Op_UI_Marker_Remove);
+    g_opTable.emplace("ui.hud.toggle", &Op_UI_HUD_Toggle);
+
+    g_opTable.emplace("time.set", &Op_Time_Set);
+    g_opTable.emplace("time.pause", &Op_Time_Pause);
+    g_opTable.emplace("time.resume", &Op_Time_Resume);
+
+    g_opTable.emplace("weather.set", &Op_Weather_Set);
+
+    g_opTable.emplace("player.teleport", &Op_Player_Teleport);
+    g_opTable.emplace("player.heal", &Op_Player_Heal);
+    g_opTable.emplace("player.damage", &Op_Player_Damage);
+    g_opTable.emplace("player.inventory.add", &Op_Player_Inventory_Add);
+    g_opTable.emplace("player.inventory.remove", &Op_Player_Inventory_Remove);
+
+    g_opTable.emplace("world.spawn.explosion", &Op_World_Spawn_Explosion);
+    g_opTable.emplace("world.light.spawn", &Op_World_Light_Spawn);
+    g_opTable.emplace("world.light.remove", &Op_World_Light_Remove);
+    g_opTable.emplace("world.streamgrid.recenter", &Op_World_StreamGrid_Recenter);
+    g_opTable.emplace("world.lod.lock", &Op_World_LOD_Lock);
+    g_opTable.emplace("world.lod.unlock", &Op_World_LOD_Unlock);
+
+    g_opTable.emplace("debug.log", &Op_Debug_Log);
+    g_opTable.emplace("debug.capture.screenshot", &Op_Debug_Capture_Screenshot);
+
+    g_opTable.emplace("config.set", &Op_Config_Set);
+    g_opTable.emplace("config.get", &Op_Config_Get);
+
+    g_opTable.emplace("ops.capabilities", &Op_Ops_Capabilities);
+    g_opTable.emplace("ping", &Op_Ping);
+
+    g_opTable.emplace("upscaler.enable", &Op_Upscaler_Enable);
+    g_opTable.emplace("upscaler.set", &Op_Upscaler_Set);
+    g_opTable.emplace("graphics.target.set", &Op_Graphics_Target_Set);
+    g_opTable.emplace("graphics.internal.scale", &Op_Graphics_Internal_Scale);
+
+#if MB_HAS_LIGHTSFAKE
+    g_opTable.emplace("lights.fake.adverts", &Op_LightsFake_Adverts);
+    g_opTable.emplace("lights.fake.portals", &Op_LightsFake_Portals);
+    g_opTable.emplace("lights.fake.forceportals", &Op_LightsFake_ForcePortals);
+    g_opTable.emplace("lights.fake.sweep", &Op_LightsFake_Sweep);
+#endif
+}
 
 // ---------- Server loop ----------
 static void ServerWorker()
@@ -548,11 +719,12 @@ static void ServerWorker()
             if (!req.contains("op")) { ReplyErr(req, reply, "BadArgs", "op required"); continue; }
 
             std::string op = req["op"].get<std::string>();
-            auto it = g_ops.find(op);
-            if (it == g_ops.end()) { ReplyErr(req, reply, "UnknownOp", op); continue; }
+            auto it = g_opTable.find(op);
+            if (it == g_opTable.end()) { ReplyErr(req, reply, "UnknownOp", op); continue; }
 
             try { it->second(req, reply); }
             catch (const std::exception& e) { ReplyErr(req, reply, "Exception", e.what()); }
+            catch (...) { ReplyErr(req, reply, "Exception", "unknown"); }
         }
 
         FlushFileBuffers(g_pipe);
@@ -563,83 +735,6 @@ static void ServerWorker()
         MB_Log("Client disconnected.");
     }
     MB_Log("Server worker stopped.");
-}
-
-// ---------- Registration ----------
-static void RegisterOps()
-{
-    g_ops.emplace("ui.toast", &Op_UI_Toast);
-    g_ops.emplace("timescale.set", &Op_TimeScale_Set);
-    g_ops.emplace("lod.pin", &Op_LOD_Pin);
-    g_ops.emplace("traffic.mul", &Op_Traffic_Mul);
-
-    g_ops.emplace("npc.freeze", &Op_NPC_Freeze);
-    g_ops.emplace("npc.unfreeze", &Op_NPC_Unfreeze);
-    g_ops.emplace("npc.spawn", &Op_NPC_Spawn);
-    g_ops.emplace("npc.despawn", &Op_NPC_Despawn);
-    g_ops.emplace("npc.teleport", &Op_NPC_Teleport);
-
-    g_ops.emplace("vehicle.spawn", &Op_Vehicle_Spawn);
-    g_ops.emplace("vehicle.despawn", &Op_Vehicle_Despawn);
-    g_ops.emplace("vehicle.boost", &Op_Vehicle_Boost);
-    g_ops.emplace("vehicle.paint", &Op_Vehicle_Paint);
-    g_ops.emplace("vehicle.repair", &Op_Vehicle_Repair);
-
-    g_ops.emplace("traffic.clear", &Op_Traffic_Clear);
-    g_ops.emplace("traffic.freeze", &Op_Traffic_Freeze);
-    g_ops.emplace("traffic.unfreeze", &Op_Traffic_Unfreeze);
-    g_ops.emplace("traffic.route", &Op_Traffic_Route);
-    g_ops.emplace("traffic.persist", &Op_Traffic_Persist);
-
-    g_ops.emplace("av.spawn", &Op_AV_Spawn);
-    g_ops.emplace("av.route.set", &Op_AV_Route_Set);
-    g_ops.emplace("av.despawn", &Op_AV_Despawn);
-    g_ops.emplace("av.land", &Op_AV_Land);
-    g_ops.emplace("av.takeoff", &Op_AV_Takeoff);
-
-    g_ops.emplace("train.persist", &Op_Train_Persist);
-    g_ops.emplace("train.spawn", &Op_Train_Spawn);
-    g_ops.emplace("train.despawn", &Op_Train_Despawn);
-    g_ops.emplace("train.freeze", &Op_Train_Freeze);
-    g_ops.emplace("train.unfreeze", &Op_Train_Unfreeze);
-
-    g_ops.emplace("ui.alert", &Op_UI_Alert);
-    g_ops.emplace("ui.marker.add", &Op_UI_Marker_Add);
-    g_ops.emplace("ui.marker.remove", &Op_UI_Marker_Remove);
-    g_ops.emplace("ui.hud.toggle", &Op_UI_HUD_Toggle);
-
-    g_ops.emplace("time.set", &Op_Time_Set);
-    g_ops.emplace("time.pause", &Op_Time_Pause);
-    g_ops.emplace("time.resume", &Op_Time_Resume);
-
-    g_ops.emplace("weather.set", &Op_Weather_Set);
-
-    g_ops.emplace("player.teleport", &Op_Player_Teleport);
-    g_ops.emplace("player.heal", &Op_Player_Heal);
-    g_ops.emplace("player.damage", &Op_Player_Damage);
-    g_ops.emplace("player.inventory.add", &Op_Player_Inventory_Add);
-    g_ops.emplace("player.inventory.remove", &Op_Player_Inventory_Remove);
-
-    g_ops.emplace("world.spawn.explosion", &Op_World_Spawn_Explosion);
-    g_ops.emplace("world.light.spawn", &Op_World_Light_Spawn);
-    g_ops.emplace("world.light.remove", &Op_World_Light_Remove);
-    g_ops.emplace("world.streamgrid.recenter", &Op_World_StreamGrid_Recenter);
-    g_ops.emplace("world.lod.lock", &Op_World_LOD_Lock);
-    g_ops.emplace("world.lod.unlock", &Op_World_LOD_Unlock);
-
-    g_ops.emplace("debug.log", &Op_Debug_Log);
-    g_ops.emplace("debug.capture.screenshot", &Op_Debug_Capture_Screenshot);
-
-    g_ops.emplace("config.set", &Op_Config_Set);
-    g_ops.emplace("config.get", &Op_Config_Get);
-
-    g_ops.emplace("ops.capabilities", &Op_Ops_Capabilities);
-    g_ops.emplace("ping", &Op_Ping);
-
-    g_ops.emplace("upscaler.enable", &Op_Upscaler_Enable);
-    g_ops.emplace("upscaler.set", &Op_Upscaler_Set);
-    g_ops.emplace("graphics.target.set", &Op_Graphics_Target_Set);
-    g_ops.emplace("graphics.internal.scale", &Op_Graphics_Internal_Scale);
 }
 
 // ---------- Public Bridge API (called from your exported Main) ----------
